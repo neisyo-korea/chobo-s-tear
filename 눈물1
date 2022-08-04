@@ -1,0 +1,322 @@
+
+
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch import nn
+import easydict
+from tqdm.notebook import trange, tqdm
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+import pickle
+from typing import List
+
+df = pd.read_csv('/content/train_data.csv')
+new_header = df.iloc[0] #grab the first row for the header
+df = df[1:] #take the data less the header row
+df.columns = new_header #set the header row as the df header
+df = df.astype(float)# str to float 문자열 숫자열로 변경
+
+
+## 데이터 Type 변경
+df['date'] = pd.to_datetime(df['Time (min)'])
+for var_index in [item for item in df.columns if 'X' in item]:
+    df[var_index] = pd.to_numeric(df[var_index], errors='coerce')
+del df['Time (min)']
+
+## date를 index로 변환
+df = df.set_index('date')
+
+df.head()
+#min값과 max값을 알고 싶다면 df.min(), df.max()를 하면됨.
+
+
+#Normal 데이터는 학습데이터, 파라미터 설정데이터, 검증용데이터, 실험용데이터의 비율을 7:1:1:1 로 나누어서 사용합니다.
+normal_df = df
+interval_n = int(len(normal_df)/10)
+normal_df1 = df.iloc[0:interval_n*7]
+normal_df2 = df.iloc[interval_n*7:interval_n*8]
+normal_df3 = df.iloc[interval_n*8:interval_n*9]
+normal_df4 = df.iloc[interval_n*9:]
+
+
+## 데이터 정규화를 위하여 분산 및 평균 추출
+mean_df = normal_df1.mean()
+std_df = normal_df1.std()
+
+## 데이터를 불러올 때 index로 불러오기
+def make_data_idx(dates, window_size=1):
+    input_idx = []
+    for idx in range(window_size-1, len(date)):
+        cur_date = dates[idx].to_pydatetime()
+        in_date = dates[idx - (window_size-1)].to_pydatetime()
+        
+        _in_period = (cur_date - in_date).days * 24 * 60 + (cur_date - in_date).seconds / 60
+        
+        ## 각 index가 1분 간격으로 떨어져 있는지를 확인합니다.
+        if _in_period == (window_size-1):
+            input_idx.append(list(range(idx - window_size+1, idx+1)))
+    return input_idx
+
+df.index.dtype
+
+## Dataset을 상속받아 데이터를 구성
+class TagDataset(Dataset):
+    def __init__(self, input_size, df, mean_df=None, std_df = None, window_size=1):
+        
+        ## 변수 갯수
+        self.input_size = input_size
+        
+        ## 복원할 sequence 길이
+        self.window_size = window_size
+        
+        ## Summary용 데이터 Deep copy
+        original_df = df.copy()
+        
+        ## 정규화
+        if mean_df is not None and std_df is not None:
+            sensor_columns = [item for item in df.columns if 'X' in item]
+            df[sensor_columns] = (df[sensor_columns]-mean_df)/std_df
+        
+        ## 연속한 index를 기준으로 학습에 사용합니다.
+        dates = list(df.index)
+        self.input_ids = make_data_idx(dates, window_size=window_size)
+        
+        ## X 데이터만 사용하여 reconstruct에 활용
+        self.selected_column = [item for item in df.columns if 'X' in item][:input_size]
+        self.var_data = torch.tensor(df[self.selected_column].values, dtype=torch.float)
+        
+        ## Summary 용
+        self.df = original_df.iloc[np.array(self.input_ids)[:, -1]]
+        
+    ## Dataset은 반드시 __len__ 함수를 만들어줘야함(데이터 길이)
+    def __len__(self):
+        return len(self.input_ids)
+    
+    ## Dataset은 반드시 __getitem__ 함수를 만들어줘야함
+    ## torch 모듈은 __getitem__ 을 호출하여 학습할 데이터를 불러옴.
+    def __getitem__(self, item):
+        temp_input_ids = self.input_ids[item]
+        input_values = self.var_data[temp_input_ids]
+        return input_values
+
+## 인코더
+class Encoder(nn.Module):
+
+    def __init__(self, input_size=52, hidden_size=13, num_layers=2):
+        super(Encoder, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True,
+                            dropout=0.1, bidirectional=False)
+
+    def forward(self, x):
+        outputs, (hidden, cell) = self.lstm(x)  # out: tensor of shape (batch_size, seq_length, hidden_size)
+
+        return (hidden, cell)
+    
+## 디코더
+class Decoder(nn.Module):
+
+    def __init__(self, input_size=52, hidden_size=13, output_size=52, num_layers=2):
+        super(Decoder, self).__init__()
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.num_layers = num_layers
+
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True,
+                            dropout=0.1, bidirectional=False)
+
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x, hidden):
+        output, (hidden, cell) = self.lstm(x, hidden)  # out: tensor of shape (batch_size, seq_length, hidden_size)
+        prediction = self.fc(output)
+
+        return prediction, (hidden, cell)
+    
+## LSTM Auto Encoder
+class LSTMAutoEncoder(nn.Module):
+
+    def __init__(self,
+                 input_dim: int,
+                 latent_dim: int,
+                 window_size: int=1,
+                 **kwargs) -> None:
+        """
+        :param input_dim: 변수 Tag 갯수
+        :param latent_dim: 최종 압축할 차원 크기
+        :param window_size: 길이
+        :param kwargs:
+        """
+
+        super(LSTMAutoEncoder, self).__init__()
+
+        self.latent_dim = latent_dim
+        self.input_dim = input_dim
+        self.window_size = window_size
+
+        if "num_layers" in kwargs:
+            num_layers = kwargs.pop("num_layers")
+        else:
+            num_layers = 1
+
+        self.encoder = Encoder(
+            input_size=input_dim,
+            hidden_size=latent_dim,
+            num_layers=num_layers,
+        )
+        self.reconstruct_decoder = Decoder(
+            input_size=input_dim,
+            output_size=input_dim,
+            hidden_size=latent_dim,
+            num_layers=num_layers,
+        )
+
+    def forward(self, src:torch.Tensor, **kwargs):
+        batch_size, sequence_length, var_length = src.size()
+
+        ## Encoder 넣기
+        encoder_hidden = self.encoder(src)
+        
+        inv_idx = torch.arange(sequence_length - 1, -1, -1).long()
+        reconstruct_output = []
+        temp_input = torch.zeros((batch_size, 1, var_length), dtype=torch.float).to(src.device)
+        hidden = encoder_hidden
+        for t in range(sequence_length):
+            temp_input, hidden = self.reconstruct_decoder(temp_input, hidden)
+            reconstruct_output.append(temp_input)
+        reconstruct_output = torch.cat(reconstruct_output, dim=1)[:, inv_idx, :]
+        
+        return [reconstruct_output, src]
+
+    def loss_function(self,
+                      *args,
+                      **kwargs) -> dict:
+        recons = args[0]
+        input = args[1]
+        
+        ## MSE loss(Mean squared Error)
+        loss =F.mse_loss(recons, input)
+        return loss
+
+def run(args, model, train_loader, test_loader):
+    # optimizer 설정
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+
+    ## 반복 횟수 Setting
+    epochs = tqdm(range(args.max_iter//len(train_loader)+1))
+    
+    ## 학습하기
+    count = 0
+    best_loss = 100000000
+    for epoch in epochs:
+        model.train()
+        optimizer.zero_grad()
+        train_iterator = tqdm(enumerate(train_loader), total=len(train_loader), desc="training")
+
+        for i, batch_data in train_iterator:
+            
+            if count > args.max_iter:
+                return model
+            count += 1
+            
+            batch_data = batch_data.to(args.device)
+            predict_values = model(batch_data)
+            loss = model.loss_function(*predict_values)
+
+            # Backward and optimize
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            train_iterator.set_postfix({
+                "train_loss": float(loss),
+            })
+
+        model.eval()
+        eval_loss = 0
+        test_iterator = tqdm(enumerate(test_loader), total=len(test_loader), desc="testing")
+        with torch.no_grad():
+            for i, batch_data in test_iterator:
+                
+                batch_data = batch_data.to(args.device)
+                predict_values = model(batch_data)
+                loss = model.loss_function(*predict_values)
+
+                eval_loss += loss.mean().item()
+
+                test_iterator.set_postfix({
+                    "eval_loss": float(loss),
+                })
+        eval_loss = eval_loss / len(test_loader)
+        epochs.set_postfix({
+             "Evaluation Score": float(eval_loss),
+        })
+        if eval_loss < best_loss:
+            best_loss = eval_loss
+        else:
+            if args.early_stop:
+                print('early stop condition   best_loss[{}]  eval_loss[{}]'.format(best_loss, eval_loss))
+                return model
+        
+    return model
+
+def get_loss_list(args, model, test_loader):
+    test_iterator = tqdm(enumerate(test_loader), total=len(test_loader), desc="testing")
+    loss_list = []
+    
+    with torch.no_grad():
+        for i, batch_data in test_iterator:
+                
+            batch_data = batch_data.to(args.device)
+            predict_values = model(batch_data)
+            
+            ## MAE(Mean Absolute Error)로 계산
+            loss = F.l1_loss(predict_values[0], predict_values[1], reduce=False)
+            #loss = loss.sum(dim=2).sum(dim=1).cpu().numpy()
+            loss = loss.mean(dim=1).cpu().numpy()
+            loss_list.append(loss)
+    loss_list = np.concatenate(loss_list, axis=0)
+    return loss_list
+
+## 하이퍼 파라미터 설정
+args = easydict.EasyDict({
+    "batch_size": 128, ## 배치 사이즈 설정
+    "device": torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'), ## GPU 사용 여부 설정
+    "input_size": 52, ## 입력 차원 설정
+    "latent_size": 10, ## Hidden 차원 설정
+    "output_size": 52, ## 출력 차원 설정
+    "window_size" : 3, ## sequence Lenght
+    "num_layers": 2,     ## LSTM layer 갯수 설정
+    "learning_rate" : 0.001, ## learning rate 설정
+    "max_iter" : 100000, ## 총 반복 횟수 설정
+    'early_stop' : True,  ## valid loss가 작아지지 않으면 early stop 조건 설정
+})
+
+## 데이터셋으로 변환
+normal_dataset1 = TagDataset(df=normal_df1, input_size=args.input_size, window_size=args.window_size, mean_df=mean_df, std_df=std_df)
+normal_dataset2 = TagDataset(df=normal_df2, input_size=args.input_size, window_size=args.window_size, mean_df=mean_df, std_df=std_df)
+normal_dataset3 = TagDataset(df=normal_df3, input_size=args.input_size, window_size=args.window_size, mean_df=mean_df, std_df=std_df)
+normal_dataset4 = TagDataset(df=normal_df4, input_size=args.input_size, window_size=args.window_size, mean_df=mean_df, std_df=std_df)
+
+#왜 안되는 걸까 
+
+## Data Loader 형태로 변환
+train_loader = torch.utils.data.DataLoader(
+                 dataset=normal_dataset1,
+                 batch_size=args.batch_size,
+                 shuffle=True)
+valid_loader = torch.utils.data.DataLoader(
+                dataset=normal_dataset2,
+                batch_size=args.batch_size,
+                shuffle=False)
+
+## 모델 생성
+model = LSTMAutoEncoder(input_dim=args.input_size, latent_dim=args.latent_size, window_size=args.window_size, num_layers=args.num_layers)
+model.to(args.device)
+
+## 학습하기
+model = run(args, model, train_loader, valid_loader)
